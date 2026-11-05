@@ -15,6 +15,7 @@ import base64
 import json
 import logging
 import struct
+import time
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -917,6 +918,56 @@ _FORGE_CORPUS_ROWS = (
 _EXPIRED_LIVE_ROWS = (
     "(ts_valid_end < NOW() OR expires_at < NOW()) AND status = ANY(:live_statuses) AND deleted_at IS NULL"
 )
+
+
+# How long ``memory_quality_metrics`` keeps the corpus counts, and the step its
+# window's start is rounded down to (Prism App Review v2 N035).
+_CORPUS_COUNT_TTL_S = 300.0
+_CORPUS_WINDOW_STEP = timedelta(minutes=5)
+
+
+class _CorpusCountCache:
+    """The report's corpus counts — ``(corpus_total, recalled_in_window)`` — per
+    scope and window, kept for ``ttl_s`` (Prism App Review v2 N035).
+
+    Those two counts are the only quality figures bounded by neither
+    ``created_at`` nor ``memory_type``: each is one pass over all of a tenant's
+    live rows, and a dashboard reads the report on every load. A share of the
+    corpus recalled in a period moves slowly, so a few minutes' lag is the
+    price of not rescanning. Per process, as a replica's own read is; bounded,
+    oldest entry out first. The key is built by the caller from every input
+    the corpus filters read, so no two scopes share a count.
+    """
+
+    def __init__(
+        self,
+        ttl_s: float = _CORPUS_COUNT_TTL_S,
+        max_entries: int = 1_024,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._ttl_s = ttl_s
+        self._max_entries = max_entries
+        self._clock = clock
+        self._entries: OrderedDict[tuple, tuple[float, tuple[int, int]]] = OrderedDict()
+
+    def get(self, key: tuple) -> tuple[int, int] | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        stored_at, counts = entry
+        if self._clock() - stored_at >= self._ttl_s:
+            del self._entries[key]
+            return None
+        return counts
+
+    def put(self, key: tuple, counts: tuple[int, int]) -> None:
+        self._entries[key] = (self._clock(), counts)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+
+_CORPUS_COUNTS = _CorpusCountCache()
 
 
 def _scope_sql(
@@ -9915,7 +9966,10 @@ class PostgresService:
         ``last_recalled_at >= recalled_after``. That is the "was the memory used
         this period" figure; never-recalled % cannot be, because a row written
         an hour ago has had an hour to be recalled. One extra pass over the
-        tenant's live rows, both counts in it (``COUNT(*) FILTER``).
+        tenant's live rows, both counts in it (``COUNT(*) FILTER``), so they
+        are kept for five minutes per scope and window (``_CorpusCountCache``),
+        and the window's start is rounded down to five minutes to share them
+        (Prism App Review v2 N035).
 
         Kept separate from the GROUPING SETS breakdown so that shared (MCP stats)
         path stays untouched. The scope/visibility block below MUST mirror
@@ -9966,6 +10020,27 @@ class PostgresService:
         # ``conflicted`` stays: search still returns it on an exact match and on
         # an entity lookup (Prism App Review v2 N034).
         corpus_filters = [*live_filters, Memory.status != "outdated"]
+        corpus_key: tuple | None = None
+        corpus_counts: tuple[int, int] | None = None
+        if recalled_after is not None:
+            # Rounded down, so every report in the same five minutes counts
+            # from the same start and can share one count.
+            hour = recalled_after.replace(minute=0, second=0, microsecond=0)
+            recalled_after -= (recalled_after - hour) % _CORPUS_WINDOW_STEP
+            # Every input the corpus filters read, so no two scopes share a
+            # count. A new scope argument belongs here too.
+            corpus_key = (
+                tenant_id,
+                tuple(sorted(readable_tenant_ids or ())),
+                fleet_id,
+                agent_id,
+                include_scope_agent,
+                tuple(sorted(exclude_memory_types or ())),
+                tuple(sorted(exclude_agent_ids or ())),
+                exclude_title_regex,
+                recalled_after,
+            )
+            corpus_counts = _CORPUS_COUNTS.get(corpus_key)
 
         reused = case((Memory.recall_count > 0, 1), else_=0)
         per_type_stmt = (
@@ -9987,12 +10062,14 @@ class PostgresService:
             per_type = (await session.execute(per_type_stmt)).all()
             total, total_reused, total_recalls = (await session.execute(overall_stmt)).one()
             top_recalls = [int(x[0] or 0) for x in (await session.execute(top_stmt)).all()]
-            if recalled_after is not None:
+            if corpus_key is not None and corpus_counts is None:
                 corpus_stmt = select(
                     func.count(),
                     func.count().filter(Memory.last_recalled_at >= recalled_after),
                 ).where(*corpus_filters)
                 corpus_total, recalled_in_window = (await session.execute(corpus_stmt)).one()
+                corpus_counts = (int(corpus_total or 0), int(recalled_in_window or 0))
+                _CORPUS_COUNTS.put(corpus_key, corpus_counts)
         result = {
             "total": int(total or 0),
             "reused": int(total_reused or 0),
@@ -10000,9 +10077,8 @@ class PostgresService:
             "top_recalls": top_recalls,
             "by_type": {r.memory_type: {"total": int(r.n), "reused": int(r.r or 0)} for r in per_type},
         }
-        if recalled_after is not None:
-            result["corpus_total"] = int(corpus_total or 0)
-            result["recalled_in_window"] = int(recalled_in_window or 0)
+        if corpus_counts is not None:
+            result["corpus_total"], result["recalled_in_window"] = corpus_counts
         return result
 
     # ══════════════════════════════════════════════════════════════════════
